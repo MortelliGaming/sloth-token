@@ -2,102 +2,215 @@
 pragma solidity ^0.8.0;
 
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/access/AccessControl.sol";
+import "@openzeppelin/contracts/utils/math/SafeMath.sol";
+import "@openzeppelin/contracts/proxy/utils/Initializable.sol";
 
-/**
- * @title TokenTimelock
- * @dev TokenTimelock is a token holder contract that will allow a
- * beneficiary to extract the tokens after a given release time
- */
-contract TokenTimelock {
-    using SafeERC20 for IERC20;
+contract TokenLocker is Initializable, AccessControl, ReentrancyGuard {
+    using SafeMath for uint256;
 
-    // ERC20 basic token contract being held
-    IERC20 private immutable _token;
+    bytes32 public constant LOCKER_ROLE = keccak256("LOCKER_ROLE");
 
-    // beneficiary that will receive the tokens after they are released
-    address private immutable _beneficiary;
+    struct Lock {
+        address token;
+        uint256 amount;
+        uint256 unlockTime;
+    }
 
-    // timestamp when token release is enabled
-    uint256 private immutable _releaseTime;
+    // Mapping from user address to token address to list of locks
+    mapping(address => mapping(address => Lock[])) private userLocks;
+    mapping(address => address[]) private userTokens;
 
-    /**
-     * @dev Deploys a new TokenTimelock instance and transfers tokens to be locked.
-     * @param token ERC20 token to be locked
-     * @param beneficiary address that will receive the tokens once they are released
-     * @param releaseTime timestamp when the release of tokens will be enabled
-     */
-    constructor(
-        IERC20 token,
-        address beneficiary,
-        uint256 releaseTime
-    ) {
-        require(releaseTime > block.timestamp, "TokenTimelock: release time is before current time");
-        _token = token;
-        _beneficiary = beneficiary;
-        _releaseTime = releaseTime;
+    event TokensLocked(address indexed user, address indexed token, uint256 amount, uint256 unlockTime);
+    event TokensWithdrawn(address indexed user, address indexed token, uint256 amount);
+    event TokenApproved(address indexed user, address indexed token, uint256 amount);
+    event LockRemoved(address indexed user, address indexed token, uint256 lockIndex);
+    event LockerRoleGranted(address indexed user);
+    event LockerRoleRevoked(address indexed user);
+
+    constructor() {
+        _grantRole(DEFAULT_ADMIN_ROLE, _msgSender());
+        _setRoleAdmin(LOCKER_ROLE, DEFAULT_ADMIN_ROLE);
     }
 
     /**
-     * @dev Transfers tokens held by the Timelock to the beneficiary. Will revert if the release time has not been reached.
+     * @dev Locks tokens for a specified amount of time.
+     * @param token The address of the ERC20 token to be locked.
+     * @param amount The amount of tokens to lock.
+     * @param lockTime The duration for which the tokens should be locked.
      */
-    function release() public virtual {
-        require(block.timestamp >= _releaseTime, "TokenTimelock: current time is before release time");
+    function lockTokens(address token, uint256 amount, uint256 lockTime) external nonReentrant {
+        require(token != address(0), "Invalid token address");
+        require(amount > 0, "Amount must be greater than zero");
+        require(lockTime > 0, "Lock time must be greater than zero");
 
-        uint256 amount = _token.balanceOf(address(this));
-        require(amount > 0, "TokenTimelock: no tokens to release");
+        // Approve the contract to spend the user's tokens
+        require(IERC20(token).allowance(msg.sender, address(this)) >= amount, "Insufficient allowance");
 
-        _token.safeTransfer(_beneficiary, amount);
-    }
-}// SPDX-License-Identifier: MIT
-pragma solidity ^0.8.0;
+        // Transfer tokens from sender to this contract
+        require(IERC20(token).transferFrom(msg.sender, address(this), amount), "Transfer failed");
 
-import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+        // Add the lock
+        userLocks[msg.sender][token].push(Lock({
+            token: token,
+            amount: amount,
+            unlockTime: block.timestamp.add(lockTime)
+        }));
 
-/**
- * @title TokenTimelock
- * @dev TokenTimelock is a token holder contract that will allow a
- * beneficiary to extract the tokens after a given release time
- */
-contract TokenTimelock {
-    using SafeERC20 for IERC20;
+        // Add the token to user's token list if it's not already there
+        if (!isTokenAdded(msg.sender, token)) {
+            userTokens[msg.sender].push(token);
+        }
 
-    // ERC20 basic token contract being held
-    IERC20 private immutable _token;
+        // Grant the LOCKER_ROLE to the user if they don't have it
+        if (!hasRole(LOCKER_ROLE, msg.sender)) {
+            _grantRole(LOCKER_ROLE, msg.sender);
+            emit LockerRoleGranted(msg.sender);
+        }
 
-    // beneficiary that will receive the tokens after they are released
-    address private immutable _beneficiary;
-
-    // timestamp when token release is enabled
-    uint256 private immutable _releaseTime;
-
-    /**
-     * @dev Deploys a new TokenTimelock instance and transfers tokens to be locked.
-     * @param token ERC20 token to be locked
-     * @param beneficiary address that will receive the tokens once they are released
-     * @param releaseTime timestamp when the release of tokens will be enabled
-     */
-    constructor(
-        IERC20 token,
-        address beneficiary,
-        uint256 releaseTime
-    ) {
-        require(releaseTime > block.timestamp, "TokenTimelock: release time is before current time");
-        _token = token;
-        _beneficiary = beneficiary;
-        _releaseTime = releaseTime;
+        emit TokensLocked(msg.sender, token, amount, block.timestamp.add(lockTime));
     }
 
     /**
-     * @dev Transfers tokens held by the Timelock to the beneficiary. Will revert if the release time has not been reached.
+     * @dev Withdraws tokens after the lock period has ended.
+     * @param token The address of the ERC20 token to be withdrawn.
+     * @param lockIndex The index of the lock to be withdrawn.
      */
-    function release() public virtual {
-        require(block.timestamp >= _releaseTime, "TokenTimelock: current time is before release time");
+    function withdrawTokens(address token, uint256 lockIndex) external onlyLocker nonReentrant {
+        require(token != address(0), "Invalid token address");
+        require(lockIndex < userLocks[msg.sender][token].length, "Invalid lock index");
 
-        uint256 amount = _token.balanceOf(address(this));
-        require(amount > 0, "TokenTimelock: no tokens to release");
+        Lock storage lock = userLocks[msg.sender][token][lockIndex];
+        require(lock.amount > 0, "No tokens to withdraw");
+        require(block.timestamp >= lock.unlockTime, "Tokens are still locked");
 
-        _token.safeTransfer(_beneficiary, amount);
+        uint256 amount = lock.amount;
+
+        // Remove the lock by swapping with the last element and then popping the last element
+        uint256 lastLockIndex = userLocks[msg.sender][token].length - 1;
+        if (lockIndex != lastLockIndex) {
+            userLocks[msg.sender][token][lockIndex] = userLocks[msg.sender][token][lastLockIndex];
+        }
+        userLocks[msg.sender][token].pop();
+
+        // If no locks are left for this token, remove the token from userTokens
+        if (userLocks[msg.sender][token].length == 0) {
+            removeToken(msg.sender, token);
+        }
+
+        // Transfer tokens back to the user
+        require(IERC20(token).transfer(msg.sender, amount), "Transfer failed");
+
+        // Revoke the LOCKER_ROLE if the user has no locks left
+        if (userLocks[msg.sender][token].length == 0 && userTokens[msg.sender].length == 0) {
+            _revokeRole(LOCKER_ROLE, msg.sender);
+            emit LockerRoleRevoked(msg.sender);
+        }
+
+        emit TokensWithdrawn(msg.sender, token, amount);
+        emit LockRemoved(msg.sender, token, lockIndex);
+    }
+
+    /**
+     * @dev Approves the contract to spend the user's tokens.
+     * @param token The address of the ERC20 token to be approved.
+     * @param amount The amount of tokens to be approved.
+     */
+    function approveTokens(address token, uint256 amount) external onlyLocker {
+        require(token != address(0), "Invalid token address");
+        require(amount > 0, "Amount must be greater than zero");
+
+        require(IERC20(token).approve(address(this), amount), "Approval failed");
+
+        emit TokenApproved(msg.sender, token, amount);
+    }
+
+    /**
+     * @dev Returns all locks for a given user.
+     * @param user The address of the user.
+     * @return A flat array of all locks.
+     */
+    function getLocks(address user) external view returns (Lock[] memory) {
+        require(user != address(0), "Invalid user address");
+
+        uint256 totalLocks = 0;
+
+        // Calculate the total number of locks
+        for (uint256 i = 0; i < userTokens[user].length; i++) {
+            totalLocks += userLocks[user][userTokens[user][i]].length;
+        }
+
+        // Create a flat array of all locks
+        Lock[] memory allLocks = new Lock[](totalLocks);
+        uint256 index = 0;
+
+        for (uint256 i = 0; i < userTokens[user].length; i++) {
+            address token = userTokens[user][i];
+            Lock[] storage locks = userLocks[user][token];
+            for (uint256 j = 0; j < locks.length; j++) {
+                allLocks[index] = locks[j];
+                index++;
+            }
+        }
+        return allLocks;
+    }
+
+    /**
+     * @dev Returns the remaining time for a specific lock.
+     * @param user The address of the user.
+     * @param token The address of the ERC20 token.
+     * @param lockIndex The index of the lock.
+     * @return The remaining time in seconds.
+     */
+    function getRemainingTime(address user, address token, uint256 lockIndex) external view returns (uint256) {
+        require(user != address(0), "Invalid user address");
+        require(token != address(0), "Invalid token address");
+        require(lockIndex < userLocks[user][token].length, "Invalid lock index");
+
+        Lock storage lock = userLocks[user][token][lockIndex];
+        if (block.timestamp >= lock.unlockTime) {
+            return 0;
+        } else {
+            return lock.unlockTime.sub(block.timestamp);
+        }
+    }
+
+    /**
+     * @dev Checks if a token is already added to the user's token list.
+     * @param user The address of the user.
+     * @param token The address of the ERC20 token.
+     * @return True if the token is already added, false otherwise.
+     */
+    function isTokenAdded(address user, address token) internal view returns (bool) {
+        address[] storage tokens = userTokens[user];
+        for (uint256 i = 0; i < tokens.length; i++) {
+            if (tokens[i] == token) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * @dev Removes a token from the user's token list if no locks are left.
+     * @param user The address of the user.
+     * @param token The address of the ERC20 token.
+     */
+    function removeToken(address user, address token) internal {
+        address[] storage tokens = userTokens[user];
+        uint256 tokenCount = tokens.length;
+        for (uint256 i = 0; i < tokenCount; i++) {
+            if (tokens[i] == token) {
+                tokens[i] = tokens[tokenCount - 1];
+                tokens.pop();
+                break;
+            }
+        }
+    }
+
+    modifier onlyLocker() {
+        require(hasRole(LOCKER_ROLE, msg.sender), "Caller is not a locker");
+        _;
     }
 }
