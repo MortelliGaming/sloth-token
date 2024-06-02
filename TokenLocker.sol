@@ -2,216 +2,134 @@
 pragma solidity ^0.8.0;
 
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
-import "@openzeppelin/contracts/access/AccessControl.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/utils/math/SafeMath.sol";
-import "@openzeppelin/contracts/proxy/utils/Initializable.sol";
+import "@openzeppelin/contracts/utils/math/Math.sol";
+import "@openzeppelin/contracts/utils/Context.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
 
-contract TokenLocker is Initializable, AccessControl, ReentrancyGuard {
+/**
+ * @title MyTokenVesting
+ * @dev A contract for token vesting with configurable schedules.
+ */
+contract MyTokenVesting is Context, Ownable {
     using SafeMath for uint256;
+    using SafeERC20 for IERC20;
 
-    bytes32 public constant LOCKER_ROLE = keccak256("LOCKER_ROLE");
-
-    struct Lock {
-        address token;
-        uint256 amount;
-        uint256 unlockTime;
+    struct VestingSchedule {
+        uint256 totalAmount;        // Total amount of tokens to be vested
+        uint256 startTime;          // Start time of the vesting schedule
+        uint256 cliffDuration;      // Duration in seconds of the cliff period
+        uint256 vestingDuration;    // Duration in seconds of the vesting period after the cliff
+        uint256 lastReleasedTime;   // Timestamp of the last time tokens were released
     }
 
-    // Mapping from user address to token address to list of locks
-    mapping(address => mapping(address => Lock[])) private userLocks;
-    mapping(address => address[]) private userTokens;
+    mapping(address => VestingSchedule) private _vestingSchedules; // Mapping of beneficiaries to their vesting schedules
 
-    event TokensLocked(address indexed user, address indexed token, uint256 amount, uint256 unlockTime);
-    event TokensWithdrawn(address indexed user, address indexed token, uint256 amount);
-    event TokenApproved(address indexed user, address indexed token, uint256 amount);
-    event LockRemoved(address indexed user, address indexed token, uint256 lockIndex);
-    event LockerRoleGranted(address indexed user);
-    event LockerRoleRevoked(address indexed user);
+    IERC20 private _token; // The ERC20 token being vested
 
-    function initialize() public initializer {
-        grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
-        _setRoleAdmin(LOCKER_ROLE, DEFAULT_ADMIN_ROLE);
+    event TokensReleased(address indexed beneficiary, uint256 amount);
+
+    /**
+     * @dev Constructor to initialize the vesting contract.
+     * @param token The address of the ERC20 token to be vested.
+     */
+    constructor(IERC20 token) Ownable(_msgSender()) {
+        _token = token;
     }
 
     /**
-     * @dev Locks tokens for a specified amount of time.
-     * @param token The address of the ERC20 token to be locked.
-     * @param amount The amount of tokens to lock.
-     * @param lockTime The duration for which the tokens should be locked.
+     * @dev Creates a new vesting schedule for a beneficiary.
+     * @param beneficiary The address of the beneficiary.
+     * @param totalAmount The total amount of tokens to be vested.
+     * @param startTime The start time of the vesting schedule.
+     * @param cliffDuration The duration of the cliff period.
+     * @param vestingDuration The duration of the vesting period after the cliff.
      */
-    function lockTokens(address token, uint256 amount, uint256 lockTime) external nonReentrant {
-        require(token != address(0), "Invalid token address");
-        require(amount > 0, "Amount must be greater than zero");
-        require(lockTime > 0, "Lock time must be greater than zero");
+    function createVestingSchedule(
+        address beneficiary,
+        uint256 totalAmount,
+        uint256 startTime,
+        uint256 cliffDuration,
+        uint256 vestingDuration
+    ) external onlyOwner {
+        require(beneficiary != address(0), "Vesting: beneficiary is the zero address");
+        require(totalAmount > 0, "Vesting: total amount is zero");
+        require(cliffDuration <= vestingDuration, "Vesting: cliff is longer than duration");
 
-        // Approve the contract to spend the user's tokens
-        require(IERC20(token).allowance(msg.sender, address(this)) >= amount, "Insufficient allowance");
+        VestingSchedule storage vestingSchedule = _vestingSchedules[beneficiary];
+        require(vestingSchedule.totalAmount == 0, "Vesting: schedule already exists");
 
-        // Transfer tokens from sender to this contract
-        require(IERC20(token).transferFrom(msg.sender, address(this), amount), "Transfer failed");
-
-        // Add the lock
-        userLocks[msg.sender][token].push(Lock({
-            token: token,
-            amount: amount,
-            unlockTime: block.timestamp.add(lockTime)
-        }));
-
-        // Add the token to user's token list if it's not already there
-        if (!isTokenAdded(msg.sender, token)) {
-            userTokens[msg.sender].push(token);
-        }
-
-        // Grant the LOCKER_ROLE to the user if they don't have it
-        if (!hasRole(LOCKER_ROLE, msg.sender)) {
-            _grantRole(LOCKER_ROLE, msg.sender);
-            emit LockerRoleGranted(msg.sender);
-        }
-
-        emit TokensLocked(msg.sender, token, amount, block.timestamp.add(lockTime));
+        vestingSchedule.totalAmount = totalAmount;
+        vestingSchedule.startTime = startTime;
+        vestingSchedule.cliffDuration = cliffDuration;
+        vestingSchedule.vestingDuration = vestingDuration;
+        vestingSchedule.lastReleasedTime = 0;
     }
 
     /**
-     * @dev Withdraws tokens after the lock period has ended.
-     * @param token The address of the ERC20 token to be withdrawn.
-     * @param lockIndex The index of the lock to be withdrawn.
+     * @dev Releases vested tokens to a beneficiary.
+     * @param beneficiary The address of the beneficiary.
      */
-    function withdrawTokens(address token, uint256 lockIndex) external onlyLocker nonReentrant {
-        require(token != address(0), "Invalid token address");
-        require(lockIndex < userLocks[msg.sender][token].length, "Invalid lock index");
+    function release(address beneficiary) external {
+        require(beneficiary != address(0), "Vesting: beneficiary is the zero address");
 
-        Lock storage lock = userLocks[msg.sender][token][lockIndex];
-        require(lock.amount > 0, "No tokens to withdraw");
-        require(block.timestamp >= lock.unlockTime, "Tokens are still locked");
+        VestingSchedule storage vestingSchedule = _vestingSchedules[beneficiary];
+        require(vestingSchedule.totalAmount > 0, "Vesting: no schedule found");
 
-        uint256 amount = lock.amount;
+        uint256 availableAmount = _releasableAmount(vestingSchedule);
+        require(availableAmount > 0, "Vesting: no tokens to release");
 
-        // Remove the lock by swapping with the last element and then popping the last element
-        uint256 lastLockIndex = userLocks[msg.sender][token].length - 1;
-        if (lockIndex != lastLockIndex) {
-            userLocks[msg.sender][token][lockIndex] = userLocks[msg.sender][token][lastLockIndex];
-        }
-        userLocks[msg.sender][token].pop();
+        _token.safeTransfer(beneficiary, availableAmount);
+        emit TokensReleased(beneficiary, availableAmount);
 
-        // If no locks are left for this token, remove the token from userTokens
-        if (userLocks[msg.sender][token].length == 0) {
-            removeToken(msg.sender, token);
-        }
-
-        // Transfer tokens back to the user
-        require(IERC20(token).transfer(msg.sender, amount), "Transfer failed");
-
-        // Revoke the LOCKER_ROLE if the user has no locks left
-        if (userLocks[msg.sender][token].length == 0 && userTokens[msg.sender].length == 0) {
-            _revokeRole(LOCKER_ROLE, msg.sender);
-            emit LockerRoleRevoked(msg.sender);
-        }
-
-        emit TokensWithdrawn(msg.sender, token, amount);
-        emit LockRemoved(msg.sender, token, lockIndex);
+        vestingSchedule.lastReleasedTime = block.timestamp;
     }
 
     /**
-     * @dev Approves the contract to spend the user's tokens.
-     * @param token The address of the ERC20 token to be approved.
-     * @param amount The amount of tokens to be approved.
+     * @dev Calculates the amount of tokens that are currently available to be released.
+     * @param vestingSchedule The vesting schedule of the beneficiary.
+     * @return The amount of tokens that can be released.
      */
-    function approveTokens(address token, uint256 amount) external onlyLocker {
-        require(token != address(0), "Invalid token address");
-        require(amount > 0, "Amount must be greater than zero");
-
-        require(IERC20(token).approve(address(this), amount), "Approval failed");
-
-        emit TokenApproved(msg.sender, token, amount);
-    }
-
-    /**
-     * @dev Returns all locks for a given user.
-     * @param user The address of the user.
-     * @return A flat array of all locks.
-     */
-    function getLocks(address user) external view returns (Lock[] memory) {
-        require(user != address(0), "Invalid user address");
-
-        uint256 totalLocks = 0;
-
-        // Calculate the total number of locks
-        for (uint256 i = 0; i < userTokens[user].length; i++) {
-            totalLocks += userLocks[user][userTokens[user][i]].length;
-        }
-
-        // Create a flat array of all locks
-        Lock[] memory allLocks = new Lock[](totalLocks);
-        uint256 index = 0;
-
-        for (uint256 i = 0; i < userTokens[user].length; i++) {
-            address token = userTokens[user][i];
-            Lock[] storage locks = userLocks[user][token];
-            for (uint256 j = 0; j < locks.length; j++) {
-                allLocks[index] = locks[j];
-                index++;
-            }
-        }
-
-        return allLocks;
-    }
-
-    /**
-     * @dev Returns the remaining time for a specific lock.
-     * @param user The address of the user.
-     * @param token The address of the ERC20 token.
-     * @param lockIndex The index of the lock.
-     * @return The remaining time in seconds.
-     */
-    function getRemainingTime(address user, address token, uint256 lockIndex) external view returns (uint256) {
-        require(user != address(0), "Invalid user address");
-        require(token != address(0), "Invalid token address");
-        require(lockIndex < userLocks[user][token].length, "Invalid lock index");
-
-        Lock storage lock = userLocks[user][token][lockIndex];
-        if (block.timestamp >= lock.unlockTime) {
+    function _releasableAmount(VestingSchedule storage vestingSchedule) private view returns (uint256) {
+        if (block.timestamp < vestingSchedule.startTime.add(vestingSchedule.cliffDuration)) {
             return 0;
-        } else {
-            return lock.unlockTime.sub(block.timestamp);
         }
+
+        uint256 timeElapsed = block.timestamp.sub(vestingSchedule.startTime).sub(vestingSchedule.cliffDuration);
+        uint256 vestedAmount = timeElapsed.mul(vestingSchedule.totalAmount).div(vestingSchedule.vestingDuration);
+        uint256 unreleasedAmount = vestingSchedule.totalAmount.sub(vestedAmount);
+
+        uint256 lastReleaseTime = Math.max(vestingSchedule.startTime.add(vestingSchedule.cliffDuration), vestingSchedule.lastReleasedTime);
+        uint256 timeSinceLastRelease = block.timestamp.sub(lastReleaseTime);
+        uint256 releasableAmount = unreleasedAmount.mul(timeSinceLastRelease).div(vestingSchedule.vestingDuration);
+
+        return releasableAmount;
     }
 
     /**
-     * @dev Checks if a token is already added to the user's token list.
-     * @param user The address of the user.
-     * @param token The address of the ERC20 token.
-     * @return True if the token is already added, false otherwise.
+     * @dev Retrieves the vesting schedule of a beneficiary.
+     * @param beneficiary The address of the beneficiary.
+     * @return totalAmount Total amount of tokens in the vesting schedule.
+     * @return startTime Start time of the vesting schedule.
+     * @return cliffDuration Duration of the cliff period.
+     * @return vestingDuration Duration of the vesting period after the cliff.
+     * @return lastReleasedTime Timestamp of the last time tokens were released.
      */
-    function isTokenAdded(address user, address token) internal view returns (bool) {
-        address[] storage tokens = userTokens[user];
-        for (uint256 i = 0; i < tokens.length; i++) {
-            if (tokens[i] == token) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    /**
-     * @dev Removes a token from the user's token list if no locks are left.
-     * @param user The address of the user.
-     * @param token The address of the ERC20 token.
-     */
-    function removeToken(address user, address token) internal {
-        address[] storage tokens = userTokens[user];
-        uint256 tokenCount = tokens.length;
-        for (uint256 i = 0; i < tokenCount; i++) {
-            if (tokens[i] == token) {
-                tokens[i] = tokens[tokenCount - 1];
-                tokens.pop();
-                break;
-            }
-        }
-    }
-
-    modifier onlyLocker() {
-        require(hasRole(LOCKER_ROLE, msg.sender), "Caller is not a locker");
-        _;
+    function getVestingSchedule(address beneficiary) external view returns (
+        uint256 totalAmount,
+        uint256 startTime,
+        uint256 cliffDuration,
+        uint256 vestingDuration,
+        uint256 lastReleasedTime
+    ) {
+        VestingSchedule storage vestingSchedule = _vestingSchedules[beneficiary];
+        return (
+            vestingSchedule.totalAmount,
+            vestingSchedule.startTime,
+            vestingSchedule.cliffDuration,
+            vestingSchedule.vestingDuration,
+            vestingSchedule.lastReleasedTime
+        );
     }
 }
