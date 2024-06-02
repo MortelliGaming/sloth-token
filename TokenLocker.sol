@@ -3,11 +3,14 @@ pragma solidity ^0.8.0;
 
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
-import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/access/AccessControl.sol";
 import "@openzeppelin/contracts/utils/math/SafeMath.sol";
+import "@openzeppelin/contracts/proxy/utils/Initializable.sol";
 
-contract TokenLocker is Ownable, ReentrancyGuard {
+contract TokenLocker is Initializable, AccessControl, ReentrancyGuard {
     using SafeMath for uint256;
+
+    bytes32 public constant LOCKER_ROLE = keccak256("LOCKER_ROLE");
 
     struct Lock {
         address token;
@@ -21,10 +24,14 @@ contract TokenLocker is Ownable, ReentrancyGuard {
 
     event TokensLocked(address indexed user, address indexed token, uint256 amount, uint256 unlockTime);
     event TokensWithdrawn(address indexed user, address indexed token, uint256 amount);
+    event TokenApproved(address indexed user, address indexed token, uint256 amount);
+    event LockRemoved(address indexed user, address indexed token, uint256 lockIndex);
+    event LockerRoleGranted(address indexed user);
+    event LockerRoleRevoked(address indexed user);
 
-    constructor() Ownable(_msgSender()) {
-        // Renounce ownership immediately
-        renounceOwnership();
+    function initialize() public initializer {
+        grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
+        _setRoleAdmin(LOCKER_ROLE, DEFAULT_ADMIN_ROLE);
     }
 
     /**
@@ -37,6 +44,9 @@ contract TokenLocker is Ownable, ReentrancyGuard {
         require(token != address(0), "Invalid token address");
         require(amount > 0, "Amount must be greater than zero");
         require(lockTime > 0, "Lock time must be greater than zero");
+
+        // Approve the contract to spend the user's tokens
+        require(IERC20(token).allowance(msg.sender, address(this)) >= amount, "Insufficient allowance");
 
         // Transfer tokens from sender to this contract
         require(IERC20(token).transferFrom(msg.sender, address(this), amount), "Transfer failed");
@@ -53,6 +63,12 @@ contract TokenLocker is Ownable, ReentrancyGuard {
             userTokens[msg.sender].push(token);
         }
 
+        // Grant the LOCKER_ROLE to the user if they don't have it
+        if (!hasRole(LOCKER_ROLE, msg.sender)) {
+            _grantRole(LOCKER_ROLE, msg.sender);
+            emit LockerRoleGranted(msg.sender);
+        }
+
         emit TokensLocked(msg.sender, token, amount, block.timestamp.add(lockTime));
     }
 
@@ -61,10 +77,10 @@ contract TokenLocker is Ownable, ReentrancyGuard {
      * @param token The address of the ERC20 token to be withdrawn.
      * @param lockIndex The index of the lock to be withdrawn.
      */
-    function withdrawTokens(address token, uint256 lockIndex) external nonReentrant {
+    function withdrawTokens(address token, uint256 lockIndex) external onlyLocker nonReentrant {
         require(token != address(0), "Invalid token address");
         require(lockIndex < userLocks[msg.sender][token].length, "Invalid lock index");
-        
+
         Lock storage lock = userLocks[msg.sender][token][lockIndex];
         require(lock.amount > 0, "No tokens to withdraw");
         require(block.timestamp >= lock.unlockTime, "Tokens are still locked");
@@ -86,7 +102,28 @@ contract TokenLocker is Ownable, ReentrancyGuard {
         // Transfer tokens back to the user
         require(IERC20(token).transfer(msg.sender, amount), "Transfer failed");
 
+        // Revoke the LOCKER_ROLE if the user has no locks left
+        if (userLocks[msg.sender][token].length == 0 && userTokens[msg.sender].length == 0) {
+            _revokeRole(LOCKER_ROLE, msg.sender);
+            emit LockerRoleRevoked(msg.sender);
+        }
+
         emit TokensWithdrawn(msg.sender, token, amount);
+        emit LockRemoved(msg.sender, token, lockIndex);
+    }
+
+    /**
+     * @dev Approves the contract to spend the user's tokens.
+     * @param token The address of the ERC20 token to be approved.
+     * @param amount The amount of tokens to be approved.
+     */
+    function approveTokens(address token, uint256 amount) external onlyLocker {
+        require(token != address(0), "Invalid token address");
+        require(amount > 0, "Amount must be greater than zero");
+
+        require(IERC20(token).approve(address(this), amount), "Approval failed");
+
+        emit TokenApproved(msg.sender, token, amount);
     }
 
     /**
@@ -171,5 +208,10 @@ contract TokenLocker is Ownable, ReentrancyGuard {
                 break;
             }
         }
+    }
+
+    modifier onlyLocker() {
+        require(hasRole(LOCKER_ROLE, msg.sender), "Caller is not a locker");
+        _;
     }
 }
